@@ -1,0 +1,3 @@
+; Permit GDM's authentication domain to mmap the IR camera's video buffers.
+; Existing Fedora policy already permits the other required video operations.
+(allow xdm_t v4l_device_t (chr_file (map)))

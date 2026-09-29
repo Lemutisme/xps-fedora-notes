@@ -1,0 +1,72 @@
+diff --git a/howdy/src/pam/main.cc b/howdy/src/pam/main.cc
+index d3af59d..3cbfcb3 100644
+--- a/howdy/src/pam/main.cc
++++ b/howdy/src/pam/main.cc
+@@ -14,6 +14,8 @@
+ #include <sys/wait.h>
+ #include <syslog.h>
+ #include <unistd.h>
++#include <pwd.h>
++#include <systemd/sd-login.h>
+ 
+ #include <chrono>
+ #include <condition_variable>
+@@ -428,6 +430,39 @@ auto identify(pam_handle_t *pamh, int flags, int argc, const char **argv,
+ // the sudo command
+ PAM_EXTERN auto pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
+                                     const char **argv) -> int {
++  // Local integration: require GDM's caller to be the same user's existing
++  // local graphical session. A greeter, manager, remote, or missing session
++  // must fall back to the regular password stack.
++  for (int i = 0; i < argc; ++i) {
++    if (strcmp(argv[i], "gdm_reauth_only") != 0)
++      continue;
++    const void *service = nullptr;
++    const void *rhost = nullptr;
++    const char *session = std::getenv("GDM_AUTH_SESSION_ID");
++    if (pam_get_item(pamh, PAM_SERVICE, &service) != PAM_SUCCESS || !service ||
++        strcmp(static_cast<const char *>(service), "gdm-password") != 0 ||
++        !session || !*session ||
++        pam_get_item(pamh, PAM_RHOST, &rhost) != PAM_SUCCESS ||
++        (rhost && *static_cast<const char *>(rhost)))
++      return PAM_IGNORE;
++    const char *username = nullptr;
++    if (pam_get_user(pamh, &username, nullptr) != PAM_SUCCESS || !username)
++      return PAM_IGNORE;
++    const struct passwd *user = getpwnam(username);
++    uid_t session_uid;
++    char *session_class = nullptr;
++    char *session_type = nullptr;
++    bool allowed = user && sd_session_get_uid(session, &session_uid) >= 0 &&
++                   session_uid == user->pw_uid && sd_session_is_remote(session) == 0 &&
++                   sd_session_get_class(session, &session_class) >= 0 &&
++                   strcmp(session_class, "user") == 0 &&
++                   sd_session_get_type(session, &session_type) >= 0 &&
++                   (strcmp(session_type, "wayland") == 0 || strcmp(session_type, "x11") == 0);
++    free(session_class);
++    free(session_type);
++    if (!allowed)
++      return PAM_IGNORE;
++  }
+   return identify(pamh, flags, argc, argv, true);
+ }
+ 
+diff --git a/howdy/src/pam/meson.build b/howdy/src/pam/meson.build
+index 35cdb03..ba6f24e 100644
+--- a/howdy/src/pam/meson.build
++++ b/howdy/src/pam/meson.build
+@@ -1,5 +1,6 @@
+ inih_cpp = dependency('INIReader', fallback: ['inih', 'INIReader_dep'])
+ libevdev = dependency('libevdev')
++libsystemd = dependency('libsystemd')
+ libpam = meson.get_compiler('cpp').find_library('pam')
+ threads = dependency('threads')
+ 
+@@ -24,6 +25,7 @@ shared_library(
+ 		inih_cpp,
+ 		threads,
+ 		libevdev,
++		libsystemd,
+ 	],
+ 	link_depends: [
+ 		paths_h,

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+build-env/
+howdy-source/
+howdy-build/
+wheels/
+model-data/
+*.rpm
+*.whl
+*.dat
+*.bz2
+*.log
+*.tar
+*.tar.gz
+*.so
+*.ko
