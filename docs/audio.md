@@ -1,10 +1,10 @@
-# 修复 XPS 13 DX13260 的内置扬声器
+# Fixing the internal speakers on the XPS 13 DX13260
 
-## 现象和定位
+## Symptoms and diagnosis
 
-PipeWire、WirePlumber 正常运行，默认输出是 `sof-soundwire Speaker`，未静音；ALSA 也能识别声卡，但内置扬声器没有声音。
+PipeWire and WirePlumber were running normally, the default output was `sof-soundwire Speaker`, nothing was muted; ALSA also listed the sound card, but the internal speakers produced no sound.
 
-关键日志来自功放驱动：
+Key logs came from the amplifier driver:
 
 ```text
 cs35l56 ... FIRMWARE_MISSING
@@ -12,7 +12,7 @@ cs35l56 ... Calibration disabled due to missing firmware controls
 cs35l56 ... Can't read tuning IDs
 ```
 
-检查命令：
+Diagnostic commands:
 
 ```sh
 wpctl status
@@ -21,20 +21,20 @@ journalctl -b -k --no-pager | rg 'cs35l56|cs42l43|sof-audio'
 ls -l /usr/lib/firmware/cirrus/*10280e53*
 ```
 
-该 SKU 的固件包提供 `spkid1`、`spkid2`、`spkid3`，没有 `spkid0`。本机 ACPI 的 `SWD6.AF01` 资源列出了 **GPI4 的 2、3 两个识别引脚**，但 `spk-id-gpios` 属性只映射了第一个。当前 `spi-cs42l43` 驱动因此只读取了型号的低位。
+The firmware package for this SKU ships `spkid1`, `spkid2` and `spkid3`, but no `spkid0`. The ACPI `SWD6.AF01` resource on this unit lists **both identification pins 2 and 3 of GPI4**, but the `spk-id-gpios` property maps only the first one. As a result, the current `spi-cs42l43` driver reads only the low bit of the model ID.
 
-实测结果：
+Measured result:
 
 ```text
 gpiochip3: GPI4[2]=0, GPI4[3]=1
 Speaker ID = 2
 ```
 
-正确的两位数是 `0 | (1 << 1) = 2`，驱动只读低位则得到 `0`。这解释了为什么固件包齐全，功放却找不到适用固件。
+The correct two-bit value is `0 | (1 << 1) = 2`; reading only the low bit gives `0`. This explains why the amplifier cannot find applicable firmware even though the firmware package is complete.
 
-## 确认适用条件
+## Confirming applicability
 
-这不是对所有 XPS 都适用的固件替换。这里的映射只针对 **DX13260 / 0E53 / 实测 ID 2**，并且内核仍存在只读取低位的问题。
+This is not a firmware substitution that applies to every XPS. The mapping here is specific to **DX13260 / 0E53 / measured ID 2**, and only while the kernel still has the low-bit-only read problem.
 
 ```sh
 cat /sys/class/dmi/id/product_name
@@ -44,11 +44,11 @@ uname -r
 sudo python3 tools/read-speaker-id.py
 ```
 
-读取工具按这台机器的 ACPI 映射定位 GPIO 控制器，以输入方式读取两个引脚并释放句柄。它不写输出电平，不安装固件，也不修改驱动。其他 BIOS / 主板版本应先重新核对 ACPI；若读数不是 `0,1`，不要应用下面的 `0 → 2` 映射。
+The reading tool locates the GPIO controller according to this machine's ACPI mapping, reads the two pins as inputs and releases the handle. It does not drive output levels, install firmware, or modify the driver. On other BIOS / board revisions, re-check the ACPI tables first; if the readings are not `0,1`, do not apply the `0 → 2` mapping below.
 
-## 安装固件别名
+## Installing the firmware aliases
 
-保留发行版原有文件，在固件搜索路径的 `updates/cirrus` 目录中增加三个别名。以下代码在 Bash 中执行；若已有同名本地文件，应先检查其来源。
+Keep the distribution's original files and add three aliases in the `updates/cirrus` directory of the firmware search path. Run the following in Bash; if local files with the same names already exist, check where they come from first.
 
 ```bash
 fw_root=/usr/lib/firmware
@@ -66,19 +66,19 @@ done
 sudo restorecon -R "$fw_root/updates/cirrus"
 ```
 
-对应关系：
+Correspondence:
 
-| 驱动请求的别名 | 实际使用的发行版文件 |
+| Alias requested by the driver | Distribution file actually used |
 | --- | --- |
 | `...spkid0.wmfw.xz` | `...spkid2.wmfw.xz` |
 | `...spkid0-ampl.bin.xz` | `...spkid2-ampl.bin.xz` |
 | `...spkid0-ampr.bin.xz` | `...spkid2-ampr.bin.xz` |
 
-`spkid2.wmfw.xz` 最终指向 `cs35l56/CS35L56_Rev4.5.9.wmfw.xz`。不能随意把型号 0 指向型号 1：调音文件还包含与扬声器硬件匹配的保护参数。
+`spkid2.wmfw.xz` ultimately resolves to `cs35l56/CS35L56_Rev4.5.9.wmfw.xz`. Model 0 must not be pointed at model 1 arbitrarily: the tuning files also contain protection parameters matched to the speaker hardware.
 
-## 写入启动镜像并重启
+## Writing into the boot image and rebooting
 
-新建 `/etc/dracut.conf.d/90-xps13-dx13260-audio.conf`：
+Create `/etc/dracut.conf.d/90-xps13-dx13260-audio.conf`:
 
 ```sh
 # DX13260 / 0E53, measured speaker ID 2; affected driver reads bit 0 only.
@@ -91,31 +91,31 @@ sudo dracut --force --kver "$(uname -r)"
 sudo lsinitrd "/boot/initramfs-$(uname -r).img" | rg '10280e53-spkid[02]|CS35L56_Rev4.5.9'
 ```
 
-确认镜像包含三个别名、它们的目标文件，以及最终 `.wmfw.xz` 文件。然后保存工作并重启。该 dracut 配置也会用于后续内核的镜像生成。
+Confirm that the image contains the three aliases, their target files, and the final `.wmfw.xz` file. Then save your work and reboot. This dracut configuration is also used when generating images for future kernels.
 
-本机尝试过在线解绑、重新绑定音频 PCI 控制器，出现大量 SoundWire 超时；声卡随后重新出现，但功放仍保留旧状态。因此这里采用重启流程，不把在线重载作为部署步骤。
+On this unit, online unbind / rebind of the audio PCI controller was attempted and produced many SoundWire timeouts; the sound card reappeared afterwards, but the amplifiers kept their old state. The reboot procedure is therefore used here, and online reload is not offered as a deployment step.
 
-## 验证结果
+## Verification results
 
-重启后执行：
+After rebooting:
 
 ```sh
 journalctl -b -k --no-pager | rg 'cs35l56.*(Calibration|FIRMWARE_MISSING|tuning)'
 wpctl status
 ```
 
-2026-09-29 的实际结果：
+Actual result on 2026-09-29:
 
 ```text
 cs35l56 spi-cs35l56-right: Calibration applied
 cs35l56 spi-cs35l56-left: Calibration applied
 ```
 
-用户确认内置扬声器恢复播放。Secure Boot 保持开启；没有加载自编译内核模块。
+The user confirmed that internal speaker playback was restored. Secure Boot stayed enabled; no self-compiled kernel modules were loaded.
 
-## 撤销与后续维护
+## Rollback and ongoing maintenance
 
-确认下面三个路径仍是本方案创建的 `spkid0 → spkid2` 符号链接，然后删除它们及本方案的 dracut 配置：
+Confirm that the three paths below are still the `spkid0 → spkid2` symlinks created by this procedure, then delete them along with this procedure's dracut configuration:
 
 ```bash
 fw_root=/usr/lib/firmware/updates/cirrus
@@ -131,12 +131,12 @@ sudo rm -- /etc/dracut.conf.d/90-xps13-dx13260-audio.conf
 sudo dracut --force --kver "$(uname -r)"
 ```
 
-随后重启。如果其他已安装内核的 initramfs 也包含该别名，并且还准备启动它们，也应针对那些版本重新生成镜像。
+Then reboot. If the initramfs of other installed kernels also contains this alias and you still plan to boot them, regenerate the images for those versions as well.
 
-升级到能正确读取两个 GPIO 的内核后，驱动应直接选择 `spkid2`。确认新内核的识别和音频正常后，可以撤销临时别名。
+Once you upgrade to a kernel that correctly reads both GPIOs, the driver should select `spkid2` directly. After confirming that the new kernel detects the model correctly and audio works, the temporary aliases can be removed.
 
-## 上游依据
+## Upstream references
 
-- [Cirrus 提交的 DX13260 型号识别修复说明](https://lists.openwall.net/linux-kernel/2026/09/19/720)：解释了两位 GPIO 只映射一位的问题。
-- [作者撤回通用补丁的后续说明](https://lkml.iu.edu/2609.3/04614.html)：计划改为机型专用处理。因此本记录没有宣称该补丁已合入，也没有安装该补丁。
-- [Cirrus 对型号与调音文件的解释](https://lore-kernel.gnuweeb.org/linux-firmware/000b01dd3ac6%2439c46210%24ad4d2630%24%40opensource.cirrus.com/T/)：不能凭听感任意替换不同型号的参数。
+- [Cirrus's explanation of the DX13260 model-ID fix](https://lists.openwall.net/linux-kernel/2026/09/19/720): explains the problem of two GPIO identification pins mapped to one bit.
+- [Follow-up note withdrawing the generic patch](https://lkml.iu.edu/2609.3/04614.html): the plan changed to model-specific handling. This record therefore does not claim the patch has been merged, and the patch was not installed.
+- [Cirrus's explanation of model IDs and tuning files](https://lore-kernel.gnuweeb.org/linux-firmware/000b01dd3ac6%2439c46210%24ad4d2630%24%40opensource.cirrus.com/T/): parameters for different models cannot be swapped based on how they sound.

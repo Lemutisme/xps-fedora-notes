@@ -1,38 +1,40 @@
-# Dell XPS 13 的 Fedora 实践记录
+# Fedora notes on the Dell XPS 13
 
-在 **Dell XPS 13 DX13260 / SKU 0E53** 上完成的两个方案：内置扬声器修复，以及仅用于 GNOME 锁屏的红外人脸解锁。
+Two solutions completed on a **Dell XPS 13 DX13260 / SKU 0E53**: a fix for the internal speakers, and infrared face unlock limited to the GNOME lock screen.
 
-验证日期：**2026-09-29**。这是特定机器、特定版本上的实际部署记录；文中的硬件映射需要在目标机器上重新确认。
+Verified on **2026-09-29**. This is a record of an actual deployment on one specific machine and release; the hardware mappings in these notes must be re-confirmed on the target machine.
 
-| 方案 | 最终结果 | 文档 |
+[中文版 README](README.zh-CN.md) — the detailed guides in `docs/` are in English.
+
+| Solution | Final result | Document |
 | --- | --- | --- |
-| CS35L56 扬声器固件映射 | 重启后左右功放均报告 `Calibration applied`，实际播放恢复 | [音频修复](docs/audio.md) |
-| Howdy + IR 摄像头 + GDM | 实际锁屏后无需输入密码即可解锁；保留密码回退 | [红外人脸解锁](docs/face-unlock.md) |
+| CS35L56 speaker firmware mapping | After reboot both amplifiers report `Calibration applied`; real playback restored | [Audio fix](docs/audio.md) |
+| Howdy + IR camera + GDM | Real lock screen unlocks without typing a password; password fallback kept | [Infrared face unlock](docs/face-unlock.md) |
 
-## 已验证环境
+## Verified environment
 
-| 项目 | 值 |
+| Item | Value |
 | --- | --- |
-| 机器 / BIOS | XPS 13 DX13260，SKU `0E53`，BIOS `1.7.3` |
-| 系统 | Fedora Linux 45 Prerelease；系统发行标识为 Budgie，实际会话使用 GNOME / GDM |
-| 内核 | `7.2.8-300.fc45.x86_64` |
+| Machine / BIOS | XPS 13 DX13260, SKU `0E53`, BIOS `1.7.3` |
+| System | Fedora Linux 45 Prerelease; the system edition identifies as Budgie, but the actual session uses GNOME / GDM |
+| Kernel | `7.2.8-300.fc45.x86_64` |
 | Secure Boot / SELinux | Enabled / Enforcing |
-| 音频 | Intel SOF / SoundWire、Cirrus CS42L43、双 CS35L56 |
+| Audio | Intel SOF / SoundWire, Cirrus CS42L43, dual CS35L56 |
 | PipeWire / WirePlumber | `1.6.9` / `0.5.17` |
-| 固件包 | `cirrus-audio-firmware-20260916-1.fc45` |
+| Firmware package | `cirrus-audio-firmware-20260916-1.fc45` |
 | GDM | `51.0-1.fc45` |
-| 系统 Python / Howdy 专用 Python | `3.15.0rc2` / Fedora `3.13.15` |
-| 摄像头 | USB `0bda:55bc`；彩色 `/dev/video0`，IR `/dev/video2` |
+| System Python / Howdy-specific Python | `3.15.0rc2` / Fedora `3.13.15` |
+| Camera | USB `0bda:55bc`; color `/dev/video0`, IR `/dev/video2` |
 
-## 附件
+## Extras
 
-- [实测扬声器 ID 的读取工具](tools/read-speaker-id.py)
-- [Howdy 仅限 GDM 已有桌面会话的补丁](patches/howdy-gdm-unlock-only.patch)
-- [Howdy 配置示例](configs/howdy.ini)：默认禁用 PAM，先录入并验证
-- [最小 SELinux 权限规则](configs/howdy_ir.cil)
-- [Howdy 构建产物安装辅助工具](tools/install-howdy-artifacts.py)
-- [第三方代码说明](THIRD_PARTY.md)
+- [Tool to read the measured speaker ID](tools/read-speaker-id.py)
+- [Patch restricting Howdy to GDM unlock of an existing desktop session](patches/howdy-gdm-unlock-only.patch)
+- [Example Howdy configuration](configs/howdy.ini): PAM disabled by default; enroll and verify first
+- [Minimal SELinux allow rule](configs/howdy_ir.cil)
+- [Helper to install the Howdy build artifacts](tools/install-howdy-artifacts.py)
+- [Third-party code notes](THIRD_PARTY.md)
 
-每篇文档都包含诊断依据、部署步骤、验证结果、适用限制和撤销方法。命令中的工作目录和用户名采用变量，按自己的机器调整。
+Each document includes the diagnostic evidence, deployment steps, verification results, scope limits and rollback procedure. Working directories and user names in commands use variables; adjust them for your own machine.
 
-Howdy 提供便利的人脸认证，但不能视为 Windows Hello 的等价安全实现。这里始终保留密码，并将启用范围限制为已有本地桌面会话的解锁。
+Howdy provides convenient face authentication, but it must not be treated as a security-equivalent replacement for Windows Hello. The password is always kept, and the feature is limited to unlocking an existing local desktop session.
