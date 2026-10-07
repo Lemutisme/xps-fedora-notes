@@ -1,0 +1,409 @@
+Validate and smooth ambient light readings before brightness follows them
+
+Subject: [PATCH] adaptive-brightness: validate ALS input and confirm bucket changes
+
+The ISHTP ambient light sensor on this machine delivers roughly 60% unusable
+samples: dropped reports that read 0, negative counts, and saturation spikes
+near 1e5 lux. Measured 2026-10-07; see docs/brightness.md in
+xps-fedora-notes.
+
+Upstream applies whatever arrives after a 1 s throttle, so a single corrupt
+sample drives a full-range brightness jump. A better bucket curve cannot help,
+because corrupt values fall outside every bucket and therefore always trigger
+a switch.
+
+Two changes:
+
+  lib/SensorProxyService.js
+    Validate each reading (floor, ceiling, rate of change), fold survivors into
+    a sliding median window, and expose lastLuxValue as the smoothed value.
+    Counters are available via the new stats getter.
+
+  lib/BrightnessConfirm.js (new)
+    Hold a bucket change until it has been sustained, with asymmetric timing:
+    darkening confirms quickly to protect eyes, brightening slowly to avoid
+    glare, plus a cooldown between changes. Kept free of GNOME imports so the
+    policy can be tested directly.
+
+  extension.js
+    Confirm through BrightnessConfirm before applying a change, and read
+    lastLuxValue rather than dbus.lightLevel on resume, wake and settings
+    changes, which previously bypassed validation entirely.
+
+Replay of a real 240 s capture: 119 samples, 38 accepted, 81 rejected;
+brightness changes drop from 119 (range 15-100%, 32 steps over 2 points) to 2.
+
+Note that GNOME Shell caches extension JavaScript for the life of the
+process: after applying this, log out and log back in. Running
+"gnome-extensions disable && enable" will leave the old code in place while
+still reporting ACTIVE.
+
+The fault was measured on kernel 7.2.8-300.fc45.x86_64. On
+7.2.9-300.fc45.x86_64 the same machine reported 100% usable sensor samples
+without this patch, so its real-world benefit here is unproven; it is kept as
+insurance against the fault returning. See docs/brightness.md.
+
+--- a/extension.js
++++ b/extension.js
+@@ -5,6 +5,7 @@
+ import { DisplayBrightnessService } from './lib/DisplayBrightnessService.js';
+ import { SensorProxyService } from './lib/SensorProxyService.js';
+ import { BucketMapper } from './lib/BucketMapper.js';
++import { BrightnessConfirm } from './lib/BrightnessConfirm.js';
+ import { KeyboardBacklightService } from './lib/KeyboardBacklightService.js';
+ 
+ export default class AdaptiveBrightnessExtension extends Extension {
+@@ -14,6 +15,10 @@
+     const buckets = this._loadBucketsFromSettings();
+     this.bucketMapper = new BucketMapper(buckets);
+ 
++    // Sustain a bucket change before applying it. See lib/BrightnessConfirm.js.
++    this.confirm = new BrightnessConfirm();
++    this._appliedBucketIndex = -1;
++
+     this.notifications = new NotificationService(_);
+     this.displayBrightness = new DisplayBrightnessService();
+     this.keyboardBacklight = new KeyboardBacklightService(this.settings);
+@@ -40,8 +45,9 @@
+       }
+       this.setupHandlers();
+ 
+-      // Set initial brightness based on current light level
+-      this.adjustBrightnessForLightLevel(this.sensorProxy.dbus.lightLevel, true);
++      // Set initial brightness based on current light level.
++      // Use the validated value: dbus.lightLevel may hold a corrupt sample.
++      this.adjustBrightnessForLightLevel(this.sensorProxy.lastLuxValue, true);
+     });
+   }
+ 
+@@ -93,7 +99,7 @@
+     this.bucketSettingsChangedId = this.settings.connect('changed::brightness-buckets', () => {
+       const buckets = this._loadBucketsFromSettings();
+       this.bucketMapper = new BucketMapper(buckets);
+-      this.adjustBrightnessForLightLevel(this.sensorProxy.dbus.lightLevel, true);
++      this.adjustBrightnessForLightLevel(this.sensorProxy.lastLuxValue, true);
+     });
+   }
+ 
+@@ -129,7 +135,7 @@
+       !this.displayBrightness.displayIsActive ||
+       this.displayBrightness._settingBrightness ||
+       manualBrightness === null ||
+-      this.sensorProxy.dbus.lightLevel === null ||
++      this.sensorProxy.lastLuxValue === null ||
+       this.displayBrightness.paused
+     ) {
+       return;
+@@ -169,19 +175,39 @@
+ 
+     if (targetBucket) {
+       const targetBrightness = targetBucket.brightness;
++      const bucketIndex = this.bucketMapper.currentBucketIndex;
+ 
+       if (immediate) {
++        // Resume, wake or a settings change: the light may have changed while
++        // we were not looking, so apply at once instead of waiting it out.
++        this.confirm.reset();
++        this._appliedBucketIndex = bucketIndex;
+         this.displayBrightness.backend.brightness = targetBrightness;
+-      } else {
+-        this.displayBrightness.animateBrightness(targetBrightness).catch((e) => console.error(e));
++      } else if (this.confirm.offer(bucketIndex, this._appliedBucketIndex, this._isDarkening())) {
++        this._appliedBucketIndex = bucketIndex;
++        this.displayBrightness
++          .animateBrightness(targetBrightness)
++          .catch((e) => console.error(e));
+       }
+ 
+       this.keyboardBacklight
+-        .updateForBrightnessBucket(this.bucketMapper.currentBucketIndex)
++        .updateForBrightnessBucket(bucketIndex)
+         .catch((e) => console.error(e));
+     }
+   }
+ 
++  /** True when the current bucket is dimmer than the one on screen. */
++  _isDarkening() {
++    const buckets = this.bucketMapper.buckets;
++    if (this._appliedBucketIndex < 0 || this._appliedBucketIndex >= buckets.length) {
++      return false;
++    }
++    return (
++      buckets[this.bucketMapper.currentBucketIndex].brightness <
++      buckets[this._appliedBucketIndex].brightness
++    );
++  }
++
+   disable() {
+     // "unlock-dialog" session mode is used to be able to listen for 'prepare-for-sleep' signal from LoginManager
+     // in order to check light level immediately after resuming from suspend (with lock screen being shown).
+--- a/lib/SensorProxyService.js
++++ b/lib/SensorProxyService.js
+@@ -2,9 +2,27 @@
+ import { SensorProxyDbus } from './SensorProxyDbus.js';
+ import { CallbackManager } from './CallbackManager.js';
+ 
++// Input validation thresholds.
++//
++// The ISHTP ambient light sensor on this machine delivers roughly 60%
++// unusable samples: dropped reports that read 0, negative counts, and
++// saturation spikes around 1e5 lux. Real readings are 9-18 lux in a dark
++// room and a smooth 3000-8000 lux curve under a torch. Measured 2026-10-07;
++// see docs/brightness.md in the xps-fedora-notes repository.
++//
++// Without these checks a single corrupt sample drives a full-range
++// brightness jump, so validation has to run before the bucket mapper.
++// A well chosen bucket curve alone cannot help: corrupt values land far
++// outside every bucket, so they always trigger a switch.
++const ALS_MIN_LUX = 0.5; // 0 means "no report arrived", not "pitch dark"
++const ALS_MAX_LUX = 20000; // above this the sensor is saturated, not bright
++const ALS_MAX_RATE = 3000; // lux per second; rejects 9 -> 200000 in one step
++const ALS_WINDOW_MS = 20000; // sliding median window age
++const ALS_WINDOW_MAX = 7; // and at most this many samples
++
+ /**
+  * Service for managing IIO sensor proxy communication
+- * Handles business logic, throttling
++ * Handles business logic, throttling, and sensor input validation
+  */
+ export class SensorProxyService {
+   constructor(filterFn = null) {
+@@ -23,6 +41,16 @@
+     this._throttleTimeoutMs = 1000;
+     this._lastUpdateTime = 0;
+ 
++    // Validated ambient light state. _rawLuxValue is whatever the proxy
++    // last reported; _lastLuxValue is the smoothed reading the bucket
++    // mapper is allowed to act on.
++    this._rawLuxValue = null;
++    this._lastLuxValue = null;
++    this._window = []; // [{lux, at}] of accepted samples, oldest first
++    this._lastAcceptedLux = null;
++    this._lastAcceptedTime = 0;
++    this._stats = { seen: 0, accepted: 0, rejected: 0 };
++
+     // Lifecycle management
+     this._destroyed = false;
+ 
+@@ -66,14 +94,21 @@
+   }
+ 
+   /**
+-   * Last lux value committed after the settle/throttle window.
+-   * Returns null if no reading has been processed since the last connect or
+-   * daemon restart (i.e. the sensor is still settling).
++   * Last lux value that passed validation and smoothing.
++   * Returns null if no trustworthy reading has arrived since the last connect
++   * or daemon restart. This is deliberately not the raw proxy value: callers
++   * that re-apply brightness on resume or on a display state change must not
++   * act on an unvalidated sample.
+    */
+   get lastLuxValue() {
+     return this._lastLuxValue;
+   }
+ 
++  /** Sample counters, for diagnostics: {seen, accepted, rejected}. */
++  get stats() {
++    return { ...this._stats };
++  }
++
+   /**
+    * Handle D-Bus properties changed signals
+    * @param {Object} proxy - D-Bus proxy object
+@@ -102,8 +137,9 @@
+    * Cancels any pending timeout and resets the throttle timer so that
+    * rapid initial readings are suppressed. After the throttle interval,
+    * if no lux update has been committed yet (_lastLuxValue is still null),
+-   * the current D-Bus LightLevel value is read directly and committed,
+-   * ensuring at least one valid reading is processed after the sensor settles.
++   * the current D-Bus LightLevel value is read directly and pushed through
++   * validation, ensuring at least one valid reading is processed after the
++   * sensor settles. A corrupt value here is discarded like any other.
+    */
+   _enterSettlingMode() {
+     if (this._pendingTimeout) {
+@@ -112,6 +148,9 @@
+     }
+     this._lastUpdateTime = Date.now();
+ 
++    // Drop any half-formed candidate from before a daemon restart.
++    this._resetFilterState();
++
+     this._pendingTimeout = GLib.timeout_add(GLib.PRIORITY_LOW, this._throttleTimeoutMs, () => {
+       this._pendingTimeout = null;
+       if (!this._destroyed && this._lastLuxValue === null) {
+@@ -129,9 +168,9 @@
+    */
+   _handleLightLevelChange(level, forceUpdate = false) {
+     // Check if this change should be filtered
+-    if (!forceUpdate && this._filterFn && !this._filterFn(this._lastLuxValue, level)) {
+-      // Update our tracking but don't invoke callbacks
+-      this._lastLuxValue = level;
++    if (!forceUpdate && this._filterFn && !this._filterFn(this._rawLuxValue, level)) {
++      // Track the raw value for boundary checks but do not commit it.
++      this._rawLuxValue = level;
+       return;
+     }
+ 
+@@ -158,13 +197,76 @@
+   }
+ 
+   /**
+-   * Process light level update
++   * Validate a reading, fold it into the sliding window, and let the
++   * confirmation stage decide whether it may be acted on.
+    * @param {number} level - Light level in lux
+    */
+   _processLightLevelUpdate(level) {
+     this._lastUpdateTime = Date.now();
+-    this._lastLuxValue = level;
+-    this.onLightLevelChanged.invoke(level);
++    this._rawLuxValue = level;
++    this._stats.seen++;
++
++    if (!this._isPlausible(level)) {
++      this._stats.rejected++;
++      return;
++    }
++
++    this._stats.accepted++;
++    this._lastAcceptedLux = level;
++    this._lastAcceptedTime = Date.now();
++    this._window.push({ lux: level, at: Date.now() });
++
++    const cutoff = Date.now() - ALS_WINDOW_MS;
++    while (this._window.length > 0 && this._window[0].at < cutoff) {
++      this._window.shift();
++    }
++    if (this._window.length > ALS_WINDOW_MAX) {
++      this._window.splice(0, this._window.length - ALS_WINDOW_MAX);
++    }
++
++    this._considerLevel();
++  }
++
++  /**
++   * Reject readings that cannot be physical illuminance on this sensor.
++   * @param {number} level
++   * @returns {boolean}
++   */
++  _isPlausible(level) {
++    if (typeof level !== 'number' || !Number.isFinite(level)) {
++      return false;
++    }
++    if (level < ALS_MIN_LUX || level > ALS_MAX_LUX) {
++      return false;
++    }
++    if (this._lastAcceptedLux === null) {
++      return true;
++    }
++
++    const dt = (Date.now() - this._lastAcceptedTime) / 1000;
++    return dt <= 0 || Math.abs(level - this._lastAcceptedLux) / dt <= ALS_MAX_RATE;
++  }
++
++  /** Median of the sliding window; resists isolated bad samples. */
++  _windowMedian() {
++    const sorted = this._window.map((s) => s.lux).sort((a, b) => a - b);
++    return sorted[Math.floor(sorted.length / 2)];
++  }
++
++  /**
++   * Promote the smoothed reading. Timing decisions live in
++   * BrightnessConfirm, so this stage stays free of timers and policy.
++   */
++  _considerLevel() {
++    this._lastLuxValue = this._windowMedian();
++    this.onLightLevelChanged.invoke(this._lastLuxValue);
++  }
++
++  /** Clear smoothing state, leaving _lastLuxValue (the last good reading). */
++  _resetFilterState() {
++    this._window = [];
++    this._lastAcceptedLux = null;
++    this._lastAcceptedTime = 0;
+   }
+ 
+   destroy() {
+--- /dev/null
++++ b/lib/BrightnessConfirm.js
+@@ -0,0 +1,79 @@
++/**
++ * Bucket-level confirmation for automatic brightness.
++ *
++ * The ambient light sensor on this machine produces a usable reading only
++ * some of the time, and the readings that do arrive drift rather than step.
++ * Confirming a change therefore has to happen over a sustained period and in
++ * discrete bucket space, not on individual lux samples:
++ *
++ *  - In bucket space, a smoothly decaying source (a torch being moved away)
++ *    stays inside one bucket, so it counts as one sustained intent instead of
++ *    restarting the clock on every sample.
++ *  - Darkening is confirmed quickly, because a dark room must not be left
++ *    glaring; brightening is confirmed slowly, because a false bright reading
++ *    is the one that actually hurts.
++ *  - A cooldown keeps two adjacent buckets from oscillating against each other.
++ *
++ * This class is deliberately free of GNOME and GObject imports so the policy
++ * can be exercised directly.
++ */
++export class BrightnessConfirm {
++  constructor({
++    darkenMs = 2500,
++    brightenMs = 8000,
++    cooldownMs = 15000,
++    now = () => Date.now(),
++  } = {}) {
++    this._darkenMs = darkenMs;
++    this._brightenMs = brightenMs;
++    this._cooldownMs = cooldownMs;
++    this._now = now;
++
++    this._candidate = null;
++    this._candidateSince = 0;
++    // No cooldown before the very first change.
++    this._committedAt = -Infinity;
++  }
++
++  /**
++   * Offer the bucket the mapper currently points at.
++   *
++   * @param {number} bucketIndex - Target bucket index
++   * @param {number} appliedIndex - Bucket index currently on screen, or -1
++   * @param {boolean} darkening - True when the target is dimmer
++   * @returns {boolean} True once the target has been sustained long enough
++   */
++  offer(bucketIndex, appliedIndex, darkening) {
++    if (bucketIndex === appliedIndex) {
++      // Back where we started: abandon any pending change.
++      this._candidate = null;
++      return false;
++    }
++
++    const t = this._now();
++
++    if (this._candidate !== bucketIndex) {
++      this._candidate = bucketIndex;
++      this._candidateSince = t;
++    }
++
++    const need = darkening ? this._darkenMs : this._brightenMs;
++    if (t - this._candidateSince < need) {
++      return false;
++    }
++
++    if (t - this._committedAt < this._cooldownMs) {
++      return false;
++    }
++
++    this._candidate = null;
++    this._committedAt = t;
++    return true;
++  }
++
++  /** Forget the pending candidate, e.g. on resume or when settings change. */
++  reset() {
++    this._candidate = null;
++    this._candidateSince = 0;
++  }
++}
